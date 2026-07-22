@@ -16,6 +16,7 @@ import (
 	"github.com/layou233/zbproxy/v3/adapter"
 	"github.com/layou233/zbproxy/v3/common"
 	"github.com/layou233/zbproxy/v3/common/access"
+	"github.com/layou233/zbproxy/v3/common/authsecret"
 	"github.com/layou233/zbproxy/v3/common/buf"
 	"github.com/layou233/zbproxy/v3/common/bufio"
 	"github.com/layou233/zbproxy/v3/common/mcprotocol"
@@ -42,12 +43,25 @@ type Outbound struct {
 	hostnameAccessLists []set.StringSet
 	nameAccessLists     []set.StringSet
 	onlineCount         atomic.Int32
+	// authSecret is Normalize'd root secret; send gated by config.SendAuthSecret.
+	authSecret atomic.Value // []byte
 }
 
 var (
-	_ adapter.Outbound = (*Outbound)(nil)
-	_ network.Dialer   = (*Outbound)(nil)
+	_ adapter.Outbound           = (*Outbound)(nil)
+	_ adapter.AuthSecretOutbound = (*Outbound)(nil)
+	_ network.Dialer             = (*Outbound)(nil)
 )
+
+// SetAuthSecret stores a Normalize'd copy of the root secret (≤ MaxLen).
+func (o *Outbound) SetAuthSecret(secret string) {
+	b, err := authsecret.Normalize(secret)
+	if err != nil || b == nil {
+		o.authSecret.Store([]byte(nil))
+		return
+	}
+	o.authSecret.Store(b)
+}
 
 func NewOutbound(logger *log.Logger, newConfig *config.Outbound) (*Outbound, error) {
 	if newConfig.Minecraft == nil {
@@ -202,6 +216,18 @@ func (o *Outbound) connectServer(ctx context.Context, metadata *adapter.Metadata
 	conn, err := adapter.DialContextWithMetadata(o.dialer, ctx, "tcp", destinationAddress, metadata)
 	if err != nil {
 		return nil, err
+	}
+	// Auth secret first (before PROXY protocol), only when explicitly enabled.
+	if o.config.SendAuthSecret {
+		secret, _ := o.authSecret.Load().([]byte)
+		if len(secret) == 0 {
+			conn.Close()
+			return nil, errors.New("SendAuthSecret set but AuthSecret is empty")
+		}
+		if err = authsecret.Write(conn, secret); err != nil {
+			conn.Close()
+			return nil, common.Cause("failed to write auth secret: ", err)
+		}
 	}
 	if o.config.ProxyProtocolVersion != proxyprotocol.VersionUnspecified {
 		var localAddress netip.AddrPort

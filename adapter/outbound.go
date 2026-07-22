@@ -16,6 +16,12 @@ type Outbound interface {
 	DialContext(ctx context.Context, network string, address string) (net.Conn, error)
 }
 
+// AuthSecretOutbound is implemented by outbounds that can prepend Root.AuthSecret
+// when their config has SendAuthSecret enabled.
+type AuthSecretOutbound interface {
+	SetAuthSecret(secret string)
+}
+
 type InjectOutbound interface {
 	InjectConnection(ctx context.Context, conn *bufio.CachedConn, metadata *Metadata) error
 }

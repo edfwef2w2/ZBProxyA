@@ -8,12 +8,15 @@ type Service struct {
 	TargetPort    uint16 `json:",omitempty"`
 	Listen        uint16
 
-	EnableProxyProtocol bool                          `json:",omitempty"`
-	IPAccess            access                        `json:",omitempty"`
-	Minecraft           *MinecraftService             `json:",omitempty"`
-	TLSSniffing         *tlsSniffing                  `json:",omitempty"`
-	SocketOptions       *network.InboundSocketOptions `json:",omitempty"`
-	Outbound            proxyOptions                  `json:",omitempty"`
+	EnableProxyProtocol bool `json:",omitempty"`
+	// RequireAuthSecret enables inbound pre-shared-key verification using Root.AuthSecret.
+	// Only enable on edge listeners that accept traffic from an upstream ZBProxy node.
+	RequireAuthSecret bool                            `json:",omitempty"`
+	IPAccess          access                          `json:",omitempty"`
+	Minecraft         *MinecraftService               `json:",omitempty"`
+	TLSSniffing       *tlsSniffing                    `json:",omitempty"`
+	SocketOptions     *network.InboundSocketOptions   `json:",omitempty"`
+	Outbound          proxyOptions                    `json:",omitempty"`
 }
 
 type access struct {

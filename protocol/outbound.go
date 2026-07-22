@@ -8,9 +8,11 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 
 	"github.com/layou233/zbproxy/v3/adapter"
 	"github.com/layou233/zbproxy/v3/common"
+	"github.com/layou233/zbproxy/v3/common/authsecret"
 	"github.com/layou233/zbproxy/v3/common/network"
 	"github.com/layou233/zbproxy/v3/common/network/socks"
 	"github.com/layou233/zbproxy/v3/common/proxyprotocol"
@@ -40,13 +42,14 @@ type Plain struct {
 	config     *config.Outbound
 	router     adapter.Router
 	dialer     network.Dialer
-	authSecret string // 自定义验证密钥（从 Root.AuthSecret 注入）
+	authSecret atomic.Value // []byte, Normalize'd; nil-slice when disabled
 }
 
 var (
-	_ adapter.Outbound         = (*Plain)(nil)
-	_ adapter.MetadataOutbound = (*Plain)(nil)
-	_ network.Dialer           = (*Plain)(nil)
+	_ adapter.Outbound           = (*Plain)(nil)
+	_ adapter.MetadataOutbound   = (*Plain)(nil)
+	_ adapter.AuthSecretOutbound = (*Plain)(nil)
+	_ network.Dialer             = (*Plain)(nil)
 )
 
 func (o *Plain) Name() (name string) {
@@ -58,11 +61,15 @@ func (o *Plain) Name() (name string) {
 	return
 }
 
-// SetAuthSecret 设置自定义验证密钥（由上层从 Root.AuthSecret 注入）
+// SetAuthSecret stores a Normalize'd copy of the root secret (≤ MaxLen).
+// Actual send is gated by config.SendAuthSecret at dial time.
 func (o *Plain) SetAuthSecret(secret string) {
-	o.access.Lock()
-	o.authSecret = secret
-	o.access.Unlock()
+	b, err := authsecret.Normalize(secret)
+	if err != nil || b == nil {
+		o.authSecret.Store([]byte(nil))
+		return
+	}
+	o.authSecret.Store(b)
 }
 
 func (o *Plain) PostInitialize(router adapter.Router, provider adapter.RouteResourceProvider) error {
@@ -120,19 +127,19 @@ func (o *Plain) DialContextWithMetadata(ctx context.Context, network string, add
 		return nil, err
 	}
 
-	// ========== 新增：先发送自定义验证密钥（出站验证） ==========
-	// 只有当 authSecret 不为空时才发送
-	// 密钥必须在 PROXY 协议头之前写入
-	if o.authSecret != "" {
-		_, err = conn.Write([]byte(o.authSecret))
-		if err != nil {
+	// Auth secret first (before PROXY protocol), only when explicitly enabled.
+	if o.config.SendAuthSecret {
+		secret, _ := o.authSecret.Load().([]byte)
+		if len(secret) == 0 {
+			conn.Close()
+			return nil, errors.New("SendAuthSecret set but AuthSecret is empty")
+		}
+		if err = authsecret.Write(conn, secret); err != nil {
 			conn.Close()
 			return nil, common.Cause("failed to write auth secret: ", err)
 		}
 	}
-	// ========================================================
 
-	// 原有 PROXY Protocol 写入逻辑
 	if o.config.ProxyProtocolVersion != proxyprotocol.VersionUnspecified {
 		var localAddress netip.AddrPort
 		localAddress, err = netip.ParseAddrPort(conn.LocalAddr().String())

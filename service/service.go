@@ -1,18 +1,18 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"os"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/layou233/zbproxy/v3/adapter"
 	"github.com/layou233/zbproxy/v3/common"
 	"github.com/layou233/zbproxy/v3/common/access"
+	"github.com/layou233/zbproxy/v3/common/authsecret"
 	"github.com/layou233/zbproxy/v3/common/bufio"
 	"github.com/layou233/zbproxy/v3/common/network"
 	"github.com/layou233/zbproxy/v3/common/proxyprotocol"
@@ -32,24 +32,40 @@ type Service struct {
 	legacyOutbound adapter.Outbound
 	listenAddress  string
 	ipAccessLists  []set.StringSet
-	authSecret     string // 自定义验证密钥（从 Root.AuthSecret 注入）
 
-	// TODO: udp service
+	// authSecret holds Normalize'd root AuthSecret (≤ authsecret.MaxLen).
+	// atomic.Value stores []byte|nil so the listen loop can read without locks
+	// and reload can swap without allocating on the hot path.
+	authSecret atomic.Value // []byte
 }
 
 var _ adapter.Service = (*Service)(nil)
 
 func NewService(logger *log.Logger, newConfig *config.Service) *Service {
-	return &Service{
+	s := &Service{
 		listenAddress: ":" + strconv.Itoa(int(newConfig.Listen)),
 		logger:        logger,
 		config:        newConfig,
 	}
+	s.authSecret.Store([]byte(nil))
+	return s
 }
 
-// SetAuthSecret 设置自定义验证密钥（由上层从 Root.AuthSecret 注入）
+// SetAuthSecret injects the root shared secret. Safe to call concurrently
+// with the accept loop; stores a single small []byte (no per-connection copy of config string).
 func (s *Service) SetAuthSecret(secret string) {
-	s.authSecret = secret
+	b, err := authsecret.Normalize(secret)
+	if err != nil {
+		// Invalid secrets are rejected at config load; ignore here to keep service up.
+		s.logger.Warn().Err(err).Str("service", s.config.Name).Msg("Ignoring invalid AuthSecret")
+		s.authSecret.Store([]byte(nil))
+		return
+	}
+	if b == nil {
+		s.authSecret.Store([]byte(nil))
+		return
+	}
+	s.authSecret.Store(b)
 }
 
 func (s *Service) listenLoop() {
@@ -63,28 +79,33 @@ func (s *Service) listenLoop() {
 			tcpAddress := conn.RemoteAddr().(*net.TCPAddr)
 			ipString := tcpAddress.IP.String()
 
-			// ========== 入站自定义验证密钥校验（B 服务器使用） ==========
-			// 只有当配置了 RequireAuthSecret 且密钥不为空时才进行校验
-			if s.config.RequireAuthSecret && s.authSecret != "" {
-				bufConn := bufio.NewCachedConn(conn)
-				authBuf := make([]byte, len(s.authSecret))
-				n, err := io.ReadFull(bufConn, authBuf)
-				if err != nil || n != len(s.authSecret) || !bytes.Equal(authBuf, []byte(s.authSecret)) {
-					bufConn.Close()
+			// Inbound auth: only when RequireAuthSecret is set and a secret is loaded.
+			// Read directly from the TCP conn (no CachedConn) — secret ≤ 128 B stack buffer.
+			if s.config.RequireAuthSecret {
+				secret, _ := s.authSecret.Load().([]byte)
+				if len(secret) == 0 {
+					// Misconfiguration: require auth but no secret → reject all (fail closed).
+					conn.SetLinger(0)
+					conn.Close()
+					s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).
+						Msg("Rejected: RequireAuthSecret set but AuthSecret is empty")
+					return
+				}
+				if err := authsecret.Verify(conn, secret, authsecret.DefaultTimeout); err != nil {
+					conn.SetLinger(0)
+					conn.Close()
 					s.logger.Warn().
 						Str("service", s.config.Name).
 						Str("ip", ipString).
-						Msg("Rejected by custom auth secret")
+						Err(err).
+						Msg("Rejected by auth secret")
 					return
 				}
-				// 验证通过，后续全部使用 bufConn
-				netConn = bufConn
 			}
-			// ========================================================
 
-			// 原有 IPAccess 检查
 			if s.ipAccessLists != nil &&
 				!access.Check(s.ipAccessLists, s.config.IPAccess.Mode, ipString) {
+				conn.SetLinger(0)
 				netConn.Close()
 				s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).Msg("Rejected by access control")
 				return
@@ -100,13 +121,8 @@ func (s *Service) listenLoop() {
 
 			var bufConn *bufio.CachedConn
 			if s.config.EnableProxyProtocol {
-				// 如果之前已经包装过 bufConn，就复用；否则重新包装
-				if c, ok := netConn.(*bufio.CachedConn); ok {
-					bufConn = c
-				} else {
-					bufConn = bufio.NewCachedConn(netConn)
-					netConn = bufConn
-				}
+				bufConn = bufio.NewCachedConn(netConn)
+				netConn = bufConn
 				changed, err := proxyprotocol.HandleConnection(bufConn, metadata)
 				if err != nil {
 					bufConn.Close()

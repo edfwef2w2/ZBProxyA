@@ -95,6 +95,10 @@ func (i *Instance) Start() error {
 		if err != nil {
 			return common.Cause("initialize outbound ["+outboundConfig.Name+"]: ", err)
 		}
+		// Inject AuthSecret before PostInitialize / traffic.
+		if setter, ok := outbound.(adapter.AuthSecretOutbound); ok {
+			setter.SetAuthSecret(i.config.AuthSecret)
+		}
 		outboundMap[outbound.Name()] = outbound
 	}
 	i.outboundMap = outboundMap
@@ -123,7 +127,7 @@ func (i *Instance) Start() error {
 	for _, serviceConfig := range i.config.Services {
 		newService := service.NewService(i.logger, serviceConfig)
 		newService.UpdateRouter(i.router)
-		// Set the initial AuthSecret from config
+		// SetAuthSecret before Start so accept loop never races on empty secret.
 		newService.SetAuthSecret(i.config.AuthSecret)
 		err = newService.Start(i.ctx)
 		if err != nil {
@@ -145,6 +149,10 @@ func (i *Instance) UpdateConfig() {
 	newOutboundMap := make(map[string]adapter.Outbound, len(i.config.Outbounds))
 	for _, outboundConfig := range i.config.Outbounds {
 		if oldOutbound, ok := i.outboundMap[outboundConfig.Name]; ok {
+			// Refresh secret before reload so dials after reload see the new key.
+			if setter, ok := oldOutbound.(adapter.AuthSecretOutbound); ok {
+				setter.SetAuthSecret(i.config.AuthSecret)
+			}
 			err := oldOutbound.Reload(adapter.OutboundReloadOptions{
 				Router: i.router,
 				Config: outboundConfig,
@@ -160,6 +168,9 @@ func (i *Instance) UpdateConfig() {
 			if err != nil {
 				i.logger.Error().Str("outbound", outboundConfig.Name).Err(err).Msg("Error when initializing outbounds")
 				return
+			}
+			if setter, ok := newOutbound.(adapter.AuthSecretOutbound); ok {
+				setter.SetAuthSecret(i.config.AuthSecret)
 			}
 			newOutboundMap[outboundConfig.Name] = newOutbound
 		}
@@ -182,18 +193,17 @@ func (i *Instance) UpdateConfig() {
 	newServiceMap := make(map[string]adapter.Service, len(i.config.Services))
 	for _, serviceConfig := range i.config.Services {
 		if oldService, ok := i.serviceMap[serviceConfig.Name]; ok {
+			// SetAuthSecret before Reload so the new accept loop sees the current key.
+			oldService.SetAuthSecret(i.config.AuthSecret)
 			err = oldService.Reload(i.ctx, serviceConfig)
 			if err != nil {
 				i.logger.Error().Str("service", serviceConfig.Name).Err(err).Msg("Error when updating services")
 				return
 			}
-			// Sync AuthSecret to the reloaded service
-			oldService.SetAuthSecret(i.config.AuthSecret)
 			newServiceMap[serviceConfig.Name] = oldService
 		} else {
 			newService := service.NewService(i.logger, serviceConfig)
 			newService.UpdateRouter(i.router)
-			// Set AuthSecret for newly created service
 			newService.SetAuthSecret(i.config.AuthSecret)
 			err = newService.Start(i.ctx)
 			if err != nil {
