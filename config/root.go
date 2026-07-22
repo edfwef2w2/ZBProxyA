@@ -199,7 +199,7 @@ func LoadConfigFromFile(ctx context.Context, filePath string, watch bool, logger
 						TargetAddress:          "mc.hypixel.net",
 						TargetPort:             25565,
 						UDPTargetPort:          25566,
-						Transport:              "tcp",
+						Transport:              "auto",
 						TransportProbeInterval: "10s",
 						SendAuthSecret:         false,
 						Minecraft: &MinecraftService{
