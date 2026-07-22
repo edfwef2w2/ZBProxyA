@@ -123,6 +123,8 @@ func (i *Instance) Start() error {
 	for _, serviceConfig := range i.config.Services {
 		newService := service.NewService(i.logger, serviceConfig)
 		newService.UpdateRouter(i.router)
+		// Set the initial AuthSecret from config
+		newService.SetAuthSecret(i.config.AuthSecret)
 		err = newService.Start(i.ctx)
 		if err != nil {
 			return common.Cause("start service ["+serviceConfig.Name+"]: ", err)
@@ -185,10 +187,14 @@ func (i *Instance) UpdateConfig() {
 				i.logger.Error().Str("service", serviceConfig.Name).Err(err).Msg("Error when updating services")
 				return
 			}
+			// Sync AuthSecret to the reloaded service
+			oldService.SetAuthSecret(i.config.AuthSecret)
 			newServiceMap[serviceConfig.Name] = oldService
 		} else {
 			newService := service.NewService(i.logger, serviceConfig)
 			newService.UpdateRouter(i.router)
+			// Set AuthSecret for newly created service
+			newService.SetAuthSecret(i.config.AuthSecret)
 			err = newService.Start(i.ctx)
 			if err != nil {
 				i.logger.Error().Str("service", serviceConfig.Name).Err(err).Msg("Error when initializing services")
