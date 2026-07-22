@@ -1,8 +1,10 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -30,6 +32,7 @@ type Service struct {
 	legacyOutbound adapter.Outbound
 	listenAddress  string
 	ipAccessLists  []set.StringSet
+	authSecret     string // 自定义验证密钥（从 Root.AuthSecret 注入）
 
 	// TODO: udp service
 }
@@ -44,6 +47,11 @@ func NewService(logger *log.Logger, newConfig *config.Service) *Service {
 	}
 }
 
+// SetAuthSecret 设置自定义验证密钥（由上层从 Root.AuthSecret 注入）
+func (s *Service) SetAuthSecret(secret string) {
+	s.authSecret = secret
+}
+
 func (s *Service) listenLoop() {
 	for {
 		conn, err := s.tcpListener.AcceptTCP()
@@ -54,13 +62,34 @@ func (s *Service) listenLoop() {
 		go func() {
 			tcpAddress := conn.RemoteAddr().(*net.TCPAddr)
 			ipString := tcpAddress.IP.String()
+
+			// ========== 入站自定义验证密钥校验（B 服务器使用） ==========
+			// 只有当配置了 RequireAuthSecret 且密钥不为空时才进行校验
+			if s.config.RequireAuthSecret && s.authSecret != "" {
+				bufConn := bufio.NewCachedConn(conn)
+				authBuf := make([]byte, len(s.authSecret))
+				n, err := io.ReadFull(bufConn, authBuf)
+				if err != nil || n != len(s.authSecret) || !bytes.Equal(authBuf, []byte(s.authSecret)) {
+					bufConn.Close()
+					s.logger.Warn().
+						Str("service", s.config.Name).
+						Str("ip", ipString).
+						Msg("Rejected by custom auth secret")
+					return
+				}
+				// 验证通过，后续全部使用 bufConn
+				netConn = bufConn
+			}
+			// ========================================================
+
+			// 原有 IPAccess 检查
 			if s.ipAccessLists != nil &&
 				!access.Check(s.ipAccessLists, s.config.IPAccess.Mode, ipString) {
-				conn.SetLinger(0)
-				conn.Close()
+				netConn.Close()
 				s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).Msg("Rejected by access control")
 				return
 			}
+
 			metadata := &adapter.Metadata{
 				ServiceName:         s.config.Name,
 				DestinationHostname: s.config.TargetAddress,
@@ -68,10 +97,16 @@ func (s *Service) listenLoop() {
 				SourceAddress:       netip.AddrPortFrom(common.MustOK(netip.AddrFromSlice(tcpAddress.IP)).Unmap(), uint16(tcpAddress.Port)),
 			}
 			metadata.GenerateID()
+
 			var bufConn *bufio.CachedConn
 			if s.config.EnableProxyProtocol {
-				bufConn = bufio.NewCachedConn(conn)
-				netConn = bufConn
+				// 如果之前已经包装过 bufConn，就复用；否则重新包装
+				if c, ok := netConn.(*bufio.CachedConn); ok {
+					bufConn = c
+				} else {
+					bufConn = bufio.NewCachedConn(netConn)
+					netConn = bufConn
+				}
 				changed, err := proxyprotocol.HandleConnection(bufConn, metadata)
 				if err != nil {
 					bufConn.Close()
@@ -83,8 +118,10 @@ func (s *Service) listenLoop() {
 					ipString = metadata.SourceAddress.Addr().String()
 				}
 			}
+
 			s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
 				Str("ip", ipString).Msg("New inbound connection")
+
 			if s.legacyOutbound != nil {
 				defer s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
 					Str("ip", ipString).Msg("Disconnected")
