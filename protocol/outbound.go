@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -16,6 +17,8 @@ import (
 	"github.com/layou233/zbproxy/v3/common/network"
 	"github.com/layou233/zbproxy/v3/common/network/socks"
 	"github.com/layou233/zbproxy/v3/common/proxyprotocol"
+	"github.com/layou233/zbproxy/v3/common/transportselect"
+	"github.com/layou233/zbproxy/v3/common/udptunnel"
 	"github.com/layou233/zbproxy/v3/config"
 	"github.com/layou233/zbproxy/v3/protocol/minecraft"
 
@@ -42,7 +45,8 @@ type Plain struct {
 	config     *config.Outbound
 	router     adapter.Router
 	dialer     network.Dialer
-	authSecret atomic.Value // []byte, Normalize'd; nil-slice when disabled
+	authSecret atomic.Value // []byte
+	selector   *transportselect.Selector
 }
 
 var (
@@ -61,8 +65,6 @@ func (o *Plain) Name() (name string) {
 	return
 }
 
-// SetAuthSecret stores a Normalize'd copy of the root secret (≤ MaxLen).
-// Actual send is gated by config.SendAuthSecret at dial time.
 func (o *Plain) SetAuthSecret(secret string) {
 	b, err := authsecret.Normalize(secret)
 	if err != nil || b == nil {
@@ -74,9 +76,21 @@ func (o *Plain) SetAuthSecret(secret string) {
 
 func (o *Plain) PostInitialize(router adapter.Router, provider adapter.RouteResourceProvider) error {
 	var err error
+	mode := o.config.ResolvedTransport()
+	if mode == transportselect.ModeUDP || mode == transportselect.ModeAuto {
+		if o.config.ProxyOptions.Type != "" {
+			return errors.New("SOCKS proxy options are not supported with UDP/auto transport")
+		}
+	}
+	if mode == transportselect.ModeUDP && o.config.UDPTargetPort == 0 {
+		return errors.New("Transport=udp requires UDPTargetPort > 0")
+	}
 	if o.config.Dialer != "" {
 		if o.config.SocketOptions != nil {
 			return errors.New("socket options are not available when dialer is specified")
+		}
+		if mode == transportselect.ModeUDP {
+			return errors.New("nested dialer is not supported with Transport=udp")
 		}
 		o.dialer, err = provider.FindOutboundByName(o.config.Dialer)
 		if err != nil {
@@ -102,12 +116,34 @@ func (o *Plain) PostInitialize(router adapter.Router, provider adapter.RouteReso
 		}
 	}
 	o.router = router
+
+	// transport selector for auto / dual path
+	if o.selector != nil {
+		o.selector.Stop()
+		o.selector = nil
+	}
+	if mode == transportselect.ModeAuto || mode == transportselect.ModeUDP || o.config.UDPTargetPort > 0 {
+		o.selector = transportselect.New(transportselect.Config{
+			Host:         o.config.TargetAddress,
+			TCPPort:      o.config.TargetPort,
+			UDPPort:      o.config.UDPTargetPort,
+			Mode:         mode,
+			Interval:     o.config.ProbeInterval(),
+			Logger:       o.logger,
+			OutboundName: o.config.Name,
+		})
+		o.selector.Start()
+	}
 	return nil
 }
 
 func (o *Plain) Reload(options adapter.OutboundReloadOptions) error {
 	o.access.Lock()
 	defer o.access.Unlock()
+	if o.selector != nil {
+		o.selector.Stop()
+		o.selector = nil
+	}
 	o.config = options.Config
 	return o.PostInitialize(o.router, &options)
 }
@@ -122,12 +158,11 @@ func (o *Plain) DialContextWithMetadata(ctx context.Context, network string, add
 	o.access.RLock()
 	defer o.access.RUnlock()
 
-	conn, err := adapter.DialContextWithMetadata(o.dialer, ctx, network, address, metadata)
+	conn, err := o.dialTunnel(ctx, metadata)
 	if err != nil {
 		return nil, err
 	}
 
-	// Auth secret first (before PROXY protocol), only when explicitly enabled.
 	if o.config.SendAuthSecret {
 		secret, _ := o.authSecret.Load().([]byte)
 		if len(secret) == 0 {
@@ -159,4 +194,37 @@ func (o *Plain) DialContextWithMetadata(ctx context.Context, network string, add
 		}
 	}
 	return conn, nil
+}
+
+func (o *Plain) dialTunnel(ctx context.Context, metadata *adapter.Metadata) (net.Conn, error) {
+	mode := o.config.ResolvedTransport()
+	if o.selector != nil && mode == transportselect.ModeAuto {
+		mode = o.selector.Preferred()
+	}
+	host := o.config.TargetAddress
+	tunnelHop := o.config.UDPTargetPort > 0 ||
+		o.config.ResolvedTransport() == transportselect.ModeUDP ||
+		o.config.ResolvedTransport() == transportselect.ModeAuto
+
+	switch mode {
+	case transportselect.ModeUDP:
+		if o.config.UDPTargetPort == 0 {
+			return nil, errors.New("UDP path selected but UDPTargetPort is 0")
+		}
+		addr := net.JoinHostPort(host, strconv.FormatUint(uint64(o.config.UDPTargetPort), 10))
+		return udptunnel.Dial(ctx, addr)
+	default:
+		destHost := host
+		destPort := o.config.TargetPort
+		if !tunnelHop && metadata != nil {
+			if metadata.DestinationHostname != "" {
+				destHost = metadata.DestinationHostname
+			}
+			if metadata.DestinationPort > 0 {
+				destPort = metadata.DestinationPort
+			}
+		}
+		address := net.JoinHostPort(destHost, strconv.FormatUint(uint64(destPort), 10))
+		return adapter.DialContextWithMetadata(o.dialer, ctx, "tcp", address, metadata)
+	}
 }

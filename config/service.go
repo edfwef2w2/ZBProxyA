@@ -6,18 +6,38 @@ type Service struct {
 	Name          string
 	TargetAddress string `json:",omitempty"`
 	TargetPort    uint16 `json:",omitempty"`
-	Listen        uint16
+	// Listen is the TCP listen port (legacy field name, always the TCP port).
+	Listen uint16
+	// ListenUDP is the UDP tunnel listen port. 0 = UDP inbound disabled.
+	ListenUDP uint16 `json:"ListenUDP"`
+
+	// EnableTCP enables TCP accept on Listen. Legacy configs with both flags false → TCP on.
+	EnableTCP bool `json:"EnableTCP"`
+	// EnableUDP enables UDP tunnel accept on ListenUDP (requires ListenUDP > 0).
+	EnableUDP bool `json:"EnableUDP"`
 
 	EnableProxyProtocol bool `json:",omitempty"`
 	// RequireAuthSecret enables inbound pre-shared-key verification using Root.AuthSecret.
-	// Only enable on edge listeners that accept traffic from an upstream ZBProxy node.
-	// Always serialized so it appears in generated config (default false = off).
-	RequireAuthSecret bool                            `json:"RequireAuthSecret"`
-	IPAccess          access                          `json:",omitempty"`
-	Minecraft         *MinecraftService               `json:",omitempty"`
-	TLSSniffing       *tlsSniffing                    `json:",omitempty"`
-	SocketOptions     *network.InboundSocketOptions   `json:",omitempty"`
-	Outbound          proxyOptions                    `json:",omitempty"`
+	RequireAuthSecret bool                          `json:"RequireAuthSecret"`
+	IPAccess          access                        `json:",omitempty"`
+	Minecraft         *MinecraftService             `json:",omitempty"`
+	TLSSniffing       *tlsSniffing                  `json:",omitempty"`
+	SocketOptions     *network.InboundSocketOptions `json:",omitempty"`
+	Outbound          proxyOptions                  `json:",omitempty"`
+}
+
+// TCPEnabled reports whether TCP inbound should run.
+// Old configs leave EnableTCP/EnableUDP false → TCP only.
+func (s *Service) TCPEnabled() bool {
+	if s.EnableTCP || s.EnableUDP {
+		return s.EnableTCP
+	}
+	return true
+}
+
+// UDPEnabled reports whether UDP tunnel inbound should run.
+func (s *Service) UDPEnabled() bool {
+	return s.EnableUDP && s.ListenUDP > 0
 }
 
 type access struct {

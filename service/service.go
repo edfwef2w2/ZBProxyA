@@ -17,6 +17,7 @@ import (
 	"github.com/layou233/zbproxy/v3/common/network"
 	"github.com/layou233/zbproxy/v3/common/proxyprotocol"
 	"github.com/layou233/zbproxy/v3/common/set"
+	"github.com/layou233/zbproxy/v3/common/udptunnel"
 	"github.com/layou233/zbproxy/v3/config"
 	"github.com/layou233/zbproxy/v3/protocol/minecraft"
 
@@ -24,19 +25,17 @@ import (
 )
 
 type Service struct {
-	tcpListener    *net.TCPListener
-	ctx            context.Context
-	router         adapter.Router
-	logger         *log.Logger
-	config         *config.Service
+	tcpListener *net.TCPListener
+	udpListener *udptunnel.Listener
+	ctx         context.Context
+	router      adapter.Router
+	logger      *log.Logger
+	config      *config.Service
 	legacyOutbound adapter.Outbound
 	listenAddress  string
 	ipAccessLists  []set.StringSet
-
-	// authSecret holds Normalize'd root AuthSecret (≤ authsecret.MaxLen).
-	// atomic.Value stores []byte|nil so the listen loop can read without locks
-	// and reload can swap without allocating on the hot path.
-	authSecret atomic.Value // []byte
+	authSecret     atomic.Value // []byte
+	started        bool
 }
 
 var _ adapter.Service = (*Service)(nil)
@@ -51,12 +50,9 @@ func NewService(logger *log.Logger, newConfig *config.Service) *Service {
 	return s
 }
 
-// SetAuthSecret injects the root shared secret. Safe to call concurrently
-// with the accept loop; stores a single small []byte (no per-connection copy of config string).
 func (s *Service) SetAuthSecret(secret string) {
 	b, err := authsecret.Normalize(secret)
 	if err != nil {
-		// Invalid secrets are rejected at config load; ignore here to keep service up.
 		s.logger.Warn().Err(err).Str("service", s.config.Name).Msg("Ignoring invalid AuthSecret")
 		s.authSecret.Store([]byte(nil))
 		return
@@ -68,106 +64,141 @@ func (s *Service) SetAuthSecret(secret string) {
 	s.authSecret.Store(b)
 }
 
-func (s *Service) listenLoop() {
+func (s *Service) listenTCPLoop() {
 	for {
 		conn, err := s.tcpListener.AcceptTCP()
-		var netConn net.Conn = conn
 		if err != nil {
 			return
 		}
-		go func() {
-			tcpAddress := conn.RemoteAddr().(*net.TCPAddr)
-			ipString := tcpAddress.IP.String()
+		go s.handleInbound(conn, "tcp")
+	}
+}
 
-			// Inbound auth: only when RequireAuthSecret is set and a secret is loaded.
-			// Read directly from the TCP conn (no CachedConn) — secret ≤ 128 B stack buffer.
-			if s.config.RequireAuthSecret {
-				secret, _ := s.authSecret.Load().([]byte)
-				if len(secret) == 0 {
-					// Misconfiguration: require auth but no secret → reject all (fail closed).
-					conn.SetLinger(0)
-					conn.Close()
-					s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).
-						Msg("Rejected: RequireAuthSecret set but AuthSecret is empty")
-					return
-				}
-				if err := authsecret.Verify(conn, secret, authsecret.DefaultTimeout); err != nil {
-					conn.SetLinger(0)
-					conn.Close()
-					s.logger.Warn().
-						Str("service", s.config.Name).
-						Str("ip", ipString).
-						Err(err).
-						Msg("Rejected by auth secret")
-					return
-				}
+func (s *Service) listenUDPLoop() {
+	for {
+		conn, err := s.udpListener.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleInbound(conn, "udp")
+	}
+}
+
+func (s *Service) handleInbound(netConn net.Conn, networkKind string) {
+	defer func() {
+		// router/legacy owns close in some paths; best-effort
+	}()
+
+	remote := netConn.RemoteAddr()
+	var ipString string
+	var srcPort uint16
+	switch a := remote.(type) {
+	case *net.TCPAddr:
+		ipString = a.IP.String()
+		srcPort = uint16(a.Port)
+	case *net.UDPAddr:
+		ipString = a.IP.String()
+		srcPort = uint16(a.Port)
+	default:
+		ipString = remote.String()
+	}
+
+	if s.config.RequireAuthSecret {
+		secret, _ := s.authSecret.Load().([]byte)
+		if len(secret) == 0 {
+			if tc, ok := netConn.(*net.TCPConn); ok {
+				tc.SetLinger(0)
 			}
+			netConn.Close()
+			s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).Str("network", networkKind).
+				Msg("Rejected: RequireAuthSecret set but AuthSecret is empty")
+			return
+		}
+		if err := authsecret.Verify(netConn, secret, authsecret.DefaultTimeout); err != nil {
+			if tc, ok := netConn.(*net.TCPConn); ok {
+				tc.SetLinger(0)
+			}
+			netConn.Close()
+			s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).Str("network", networkKind).
+				Err(err).Msg("Rejected by auth secret")
+			return
+		}
+	}
 
-			if s.ipAccessLists != nil &&
-				!access.Check(s.ipAccessLists, s.config.IPAccess.Mode, ipString) {
-				conn.SetLinger(0)
-				netConn.Close()
-				s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).Msg("Rejected by access control")
+	if s.ipAccessLists != nil &&
+		!access.Check(s.ipAccessLists, s.config.IPAccess.Mode, ipString) {
+		if tc, ok := netConn.(*net.TCPConn); ok {
+			tc.SetLinger(0)
+		}
+		netConn.Close()
+		s.logger.Warn().Str("service", s.config.Name).Str("ip", ipString).Str("network", networkKind).
+			Msg("Rejected by access control")
+		return
+	}
+
+	var srcAddr netip.AddrPort
+	if tcpAddr, ok := remote.(*net.TCPAddr); ok {
+		srcAddr = netip.AddrPortFrom(common.MustOK(netip.AddrFromSlice(tcpAddr.IP)).Unmap(), uint16(tcpAddr.Port))
+	} else if udpAddr, ok := remote.(*net.UDPAddr); ok {
+		srcAddr = netip.AddrPortFrom(common.MustOK(netip.AddrFromSlice(udpAddr.IP)).Unmap(), uint16(udpAddr.Port))
+	} else {
+		srcAddr = netip.AddrPortFrom(netip.IPv4Unspecified(), srcPort)
+	}
+
+	metadata := &adapter.Metadata{
+		ServiceName:         s.config.Name,
+		DestinationHostname: s.config.TargetAddress,
+		DestinationPort:     s.config.TargetPort,
+		SourceAddress:       srcAddr,
+	}
+	metadata.GenerateID()
+
+	var bufConn *bufio.CachedConn
+	if s.config.EnableProxyProtocol {
+		bufConn = bufio.NewCachedConn(netConn)
+		netConn = bufConn
+		changed, err := proxyprotocol.HandleConnection(bufConn, metadata)
+		if err != nil {
+			bufConn.Close()
+			s.logger.Warn().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
+				Str("ip", ipString).Str("network", networkKind).Err(err).Msg("Error when reading PROXY protocol header")
+			return
+		}
+		if changed {
+			ipString = metadata.SourceAddress.Addr().String()
+		}
+	}
+
+	s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
+		Str("ip", ipString).Str("network", networkKind).Msg("New inbound connection")
+
+	if s.legacyOutbound != nil {
+		defer s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
+			Str("ip", ipString).Msg("Disconnected")
+		defer netConn.Close()
+		switch outbound := s.legacyOutbound.(type) {
+		case *minecraft.Outbound:
+			bufConn = bufio.NewCachedConn(netConn)
+			err := minecraft.SniffClientHandshake(bufConn, metadata)
+			bufConn.Release()
+			if err != nil {
+				s.logger.Warn().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
+					Str("ip", ipString).Err(err).Msg("Error when reading Minecraft handshake")
 				return
 			}
-
-			metadata := &adapter.Metadata{
-				ServiceName:         s.config.Name,
-				DestinationHostname: s.config.TargetAddress,
-				DestinationPort:     s.config.TargetPort,
-				SourceAddress:       netip.AddrPortFrom(common.MustOK(netip.AddrFromSlice(tcpAddress.IP)).Unmap(), uint16(tcpAddress.Port)),
+			err = outbound.InjectConnection(s.ctx, bufConn, metadata)
+			if err != nil {
+				s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
+					Str("player", metadata.Minecraft.PlayerName).Err(err).Msg("Handling Minecraft connection")
 			}
-			metadata.GenerateID()
-
-			var bufConn *bufio.CachedConn
-			if s.config.EnableProxyProtocol {
-				bufConn = bufio.NewCachedConn(netConn)
-				netConn = bufConn
-				changed, err := proxyprotocol.HandleConnection(bufConn, metadata)
-				if err != nil {
-					bufConn.Close()
-					s.logger.Warn().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
-						Str("ip", ipString).Err(err).Msg("Error when reading PROXY protocol header")
-					return
-				}
-				if changed {
-					ipString = metadata.SourceAddress.Addr().String()
-				}
-			}
-
-			s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
-				Str("ip", ipString).Msg("New inbound connection")
-
-			if s.legacyOutbound != nil {
-				defer s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
-					Str("ip", ipString).Msg("Disconnected")
-				defer netConn.Close()
-				switch outbound := s.legacyOutbound.(type) {
-				case *minecraft.Outbound:
-					bufConn = bufio.NewCachedConn(netConn)
-					err = minecraft.SniffClientHandshake(bufConn, metadata)
-					bufConn.Release()
-					if err != nil {
-						s.logger.Warn().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
-							Str("ip", ipString).Err(err).Msg("Error when reading Minecraft handshake")
-						return
-					}
-					err = outbound.InjectConnection(s.ctx, bufConn, metadata)
-					if err != nil {
-						s.logger.Info().Str("id", metadata.ConnectionID).Str("service", s.config.Name).
-							Str("player", metadata.Minecraft.PlayerName).Err(err).Msg("Handling Minecraft connection")
-					}
-				}
-			} else {
-				s.router.HandleConnection(netConn, metadata)
-			}
-		}()
+		}
+	} else {
+		s.router.HandleConnection(netConn, metadata)
 	}
 }
 
 func (s *Service) Start(ctx context.Context) error {
 	var err error
-	// handle legacy modes
 	if s.config.Minecraft != nil && s.config.TLSSniffing != nil {
 		return errors.New("Minecraft and TLSSniffing are mutually exclusive in legacy mode")
 	}
@@ -188,7 +219,6 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
-	// load legacy IP access control
 	if s.config.IPAccess.Mode != access.DefaultMode {
 		s.ipAccessLists, err = s.router.FindListsByTag(s.config.IPAccess.ListTags)
 		if err != nil {
@@ -196,32 +226,63 @@ func (s *Service) Start(ctx context.Context) error {
 		}
 	}
 
-	listenConfig := &net.ListenConfig{
-		Control: network.NewListenerControlFromOptions(s.config.SocketOptions),
+	enableTCP := s.config.TCPEnabled()
+	enableUDP := s.config.UDPEnabled()
+	if !enableTCP && !enableUDP {
+		return errors.New("service: neither TCP nor UDP inbound enabled")
 	}
-	if s.config.SocketOptions != nil {
-		network.SetListenerTCPKeepAlive(listenConfig, s.config.SocketOptions.KeepAliveConfig())
-		if s.config.SocketOptions.MultiPathTCP {
-			network.SetListenerMultiPathTCP(listenConfig, true)
-		}
+	if s.config.EnableUDP && s.config.ListenUDP == 0 {
+		return errors.New("service: EnableUDP requires ListenUDP > 0")
 	}
-	listener, err := listenConfig.Listen(ctx, "tcp", s.listenAddress)
-	if err != nil {
-		return common.Cause("start listening: ", err)
-	}
-	s.tcpListener = listener.(*net.TCPListener)
-	s.ctx = ctx
-	s.logger.Info().Str("service", s.config.Name).Msg("Listening on " + s.listenAddress)
 
-	go s.listenLoop()
+	s.ctx = ctx
+
+	if enableTCP {
+		listenConfig := &net.ListenConfig{
+			Control: network.NewListenerControlFromOptions(s.config.SocketOptions),
+		}
+		if s.config.SocketOptions != nil {
+			network.SetListenerTCPKeepAlive(listenConfig, s.config.SocketOptions.KeepAliveConfig())
+			if s.config.SocketOptions.MultiPathTCP {
+				network.SetListenerMultiPathTCP(listenConfig, true)
+			}
+		}
+		tcpAddr := ":" + strconv.Itoa(int(s.config.Listen))
+		listener, err := listenConfig.Listen(ctx, "tcp", tcpAddr)
+		if err != nil {
+			return common.Cause("start TCP listening: ", err)
+		}
+		s.tcpListener = listener.(*net.TCPListener)
+		s.logger.Info().Str("service", s.config.Name).Str("network", "tcp").
+			Msg("Listening on " + tcpAddr)
+		go s.listenTCPLoop()
+	}
+
+	if enableUDP {
+		udpAddr := ":" + strconv.Itoa(int(s.config.ListenUDP))
+		ul, err := udptunnel.ListenUDP("udp", udpAddr)
+		if err != nil {
+			if s.tcpListener != nil {
+				_ = s.tcpListener.Close()
+				s.tcpListener = nil
+			}
+			return common.Cause("start UDP tunnel listening: ", err)
+		}
+		s.udpListener = ul
+		s.logger.Info().Str("service", s.config.Name).Str("network", "udp").
+			Msg("Listening on " + udpAddr)
+		go s.listenUDPLoop()
+	}
+
+	s.started = true
 	return nil
 }
 
 func (s *Service) Reload(ctx context.Context, newConfig *config.Service) error {
-	if s.tcpListener == nil {
+	if !s.started {
 		return os.ErrClosed
 	}
-	s.Close()
+	_ = s.Close()
 	s.listenAddress = ":" + strconv.Itoa(int(newConfig.Listen))
 	s.config = newConfig
 	s.legacyOutbound = nil
@@ -234,10 +295,20 @@ func (s *Service) UpdateRouter(router adapter.Router) {
 }
 
 func (s *Service) Close() error {
-	if s.tcpListener == nil {
+	if !s.started && s.tcpListener == nil && s.udpListener == nil {
 		return os.ErrClosed
 	}
-	err := s.tcpListener.Close()
-	s.tcpListener = nil
+	var err error
+	if s.tcpListener != nil {
+		err = s.tcpListener.Close()
+		s.tcpListener = nil
+	}
+	if s.udpListener != nil {
+		if e := s.udpListener.Close(); e != nil && err == nil {
+			err = e
+		}
+		s.udpListener = nil
+	}
+	s.started = false
 	return err
 }

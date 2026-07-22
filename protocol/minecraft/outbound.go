@@ -24,6 +24,8 @@ import (
 	"github.com/layou233/zbproxy/v3/common/network/socks"
 	"github.com/layou233/zbproxy/v3/common/proxyprotocol"
 	"github.com/layou233/zbproxy/v3/common/set"
+	"github.com/layou233/zbproxy/v3/common/transportselect"
+	"github.com/layou233/zbproxy/v3/common/udptunnel"
 	"github.com/layou233/zbproxy/v3/config"
 	"github.com/layou233/zbproxy/v3/version"
 
@@ -45,6 +47,7 @@ type Outbound struct {
 	onlineCount         atomic.Int32
 	// authSecret is Normalize'd root secret; send gated by config.SendAuthSecret.
 	authSecret atomic.Value // []byte
+	selector   *transportselect.Selector
 }
 
 var (
@@ -162,9 +165,21 @@ func (o *Outbound) PostInitialize(router adapter.Router, provider adapter.RouteR
 		o.config.Minecraft.OnlineCount.Sample = convertedSamples
 	}
 
+	mode := o.config.ResolvedTransport()
+	if mode == transportselect.ModeUDP || mode == transportselect.ModeAuto {
+		if o.config.ProxyOptions.Type != "" {
+			return errors.New("SOCKS proxy options are not supported with UDP/auto transport")
+		}
+	}
+	if mode == transportselect.ModeUDP && o.config.UDPTargetPort == 0 {
+		return errors.New("Transport=udp requires UDPTargetPort > 0")
+	}
 	if o.config.Dialer != "" {
 		if o.config.SocketOptions != nil {
 			return errors.New("socket options are not available when dialer is specified")
+		}
+		if mode == transportselect.ModeUDP {
+			return errors.New("nested dialer is not supported with Transport=udp")
 		}
 		o.dialer, err = provider.FindOutboundByName(o.config.Dialer)
 		if err != nil {
@@ -190,12 +205,33 @@ func (o *Outbound) PostInitialize(router adapter.Router, provider adapter.RouteR
 		}
 	}
 	o.router = router
+
+	if o.selector != nil {
+		o.selector.Stop()
+		o.selector = nil
+	}
+	if mode == transportselect.ModeAuto || mode == transportselect.ModeUDP || o.config.UDPTargetPort > 0 {
+		o.selector = transportselect.New(transportselect.Config{
+			Host:         o.config.TargetAddress,
+			TCPPort:      o.config.TargetPort,
+			UDPPort:      o.config.UDPTargetPort,
+			Mode:         mode,
+			Interval:     o.config.ProbeInterval(),
+			Logger:       o.logger,
+			OutboundName: o.config.Name,
+		})
+		o.selector.Start()
+	}
 	return nil
 }
 
 func (o *Outbound) Reload(options adapter.OutboundReloadOptions) error {
 	o.access.Lock()
 	defer o.access.Unlock()
+	if o.selector != nil {
+		o.selector.Stop()
+		o.selector = nil
+	}
 	o.config = options.Config
 	o.hostnameAccessLists = nil
 	o.nameAccessLists = nil
@@ -213,7 +249,35 @@ func (o *Outbound) connectServer(ctx context.Context, metadata *adapter.Metadata
 	if !o.config.Minecraft.IgnoreSRVRedirect {
 		metadata.SRV = minecraftSRV
 	}
-	conn, err := adapter.DialContextWithMetadata(o.dialer, ctx, "tcp", destinationAddress, metadata)
+
+	mode := o.config.ResolvedTransport()
+	if o.selector != nil && mode == transportselect.ModeAuto {
+		mode = o.selector.Preferred()
+	}
+
+	// Dual-tunnel / UDP modes always dial the fixed next-hop (TargetAddress),
+	// not the rewritten game server hostname inside the Minecraft packet.
+	tunnelHop := o.config.UDPTargetPort > 0 ||
+		o.config.ResolvedTransport() == transportselect.ModeUDP ||
+		o.config.ResolvedTransport() == transportselect.ModeAuto
+
+	var conn net.Conn
+	var err error
+	switch mode {
+	case transportselect.ModeUDP:
+		if o.config.UDPTargetPort == 0 {
+			return nil, errors.New("UDP path selected but UDPTargetPort is 0")
+		}
+		udpAddr := net.JoinHostPort(o.config.TargetAddress, strconv.FormatUint(uint64(o.config.UDPTargetPort), 10))
+		conn, err = udptunnel.Dial(ctx, udpAddr)
+	default:
+		if tunnelHop {
+			tcpAddr := net.JoinHostPort(o.config.TargetAddress, strconv.FormatUint(uint64(o.config.TargetPort), 10))
+			conn, err = adapter.DialContextWithMetadata(o.dialer, ctx, "tcp", tcpAddr, metadata)
+		} else {
+			conn, err = adapter.DialContextWithMetadata(o.dialer, ctx, "tcp", destinationAddress, metadata)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}

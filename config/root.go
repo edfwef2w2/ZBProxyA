@@ -165,9 +165,11 @@ func LoadConfigFromFile(ctx context.Context, filePath string, watch bool, logger
 				AuthSecret: "",
 				Services: []*Service{
 					{
-						Name:   "Hypixel-in",
-						Listen: 25565,
-						// true only on exit-node listeners that accept upstream ZBProxy (not player-facing).
+						Name:              "Hypixel-in",
+						Listen:            25565,
+						ListenUDP:         0,
+						EnableTCP:         true,
+						EnableUDP:         false,
 						RequireAuthSecret: false,
 					},
 				},
@@ -193,12 +195,13 @@ func LoadConfigFromFile(ctx context.Context, filePath string, watch bool, logger
 				},
 				Outbounds: []*Outbound{
 					{
-						Name:          "Hypixel-out",
-						TargetAddress: "mc.hypixel.net",
-						TargetPort:    25565,
-						// true only when this outbound targets another ZBProxy with RequireAuthSecret.
-						// Keep false when targeting public game servers (e.g. Hypixel).
-						SendAuthSecret: false,
+						Name:                   "Hypixel-out",
+						TargetAddress:          "mc.hypixel.net",
+						TargetPort:             25565,
+						UDPTargetPort:          0,
+						Transport:              "tcp",
+						TransportProbeInterval: "10s",
+						SendAuthSecret:         false,
 						Minecraft: &MinecraftService{
 							OnlineCount: onlineCount{
 								Max:    20,
