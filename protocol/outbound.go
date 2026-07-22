@@ -35,11 +35,12 @@ func NewOutbound(logger *log.Logger, newConfig *config.Outbound) (adapter.Outbou
 }
 
 type Plain struct {
-	access sync.RWMutex
-	logger *log.Logger
-	config *config.Outbound
-	router adapter.Router
-	dialer network.Dialer
+	access     sync.RWMutex
+	logger     *log.Logger
+	config     *config.Outbound
+	router     adapter.Router
+	dialer     network.Dialer
+	authSecret string // 自定义验证密钥（从 Root.AuthSecret 注入）
 }
 
 var (
@@ -55,6 +56,13 @@ func (o *Plain) Name() (name string) {
 	}
 	o.access.RUnlock()
 	return
+}
+
+// SetAuthSecret 设置自定义验证密钥（由上层从 Root.AuthSecret 注入）
+func (o *Plain) SetAuthSecret(secret string) {
+	o.access.Lock()
+	o.authSecret = secret
+	o.access.Unlock()
 }
 
 func (o *Plain) PostInitialize(router adapter.Router, provider adapter.RouteResourceProvider) error {
@@ -106,10 +114,25 @@ func (o *Plain) DialContext(ctx context.Context, network string, address string)
 func (o *Plain) DialContextWithMetadata(ctx context.Context, network string, address string, metadata *adapter.Metadata) (net.Conn, error) {
 	o.access.RLock()
 	defer o.access.RUnlock()
+
 	conn, err := adapter.DialContextWithMetadata(o.dialer, ctx, network, address, metadata)
 	if err != nil {
 		return nil, err
 	}
+
+	// ========== 新增：先发送自定义验证密钥（出站验证） ==========
+	// 只有当 authSecret 不为空时才发送
+	// 密钥必须在 PROXY 协议头之前写入
+	if o.authSecret != "" {
+		_, err = conn.Write([]byte(o.authSecret))
+		if err != nil {
+			conn.Close()
+			return nil, common.Cause("failed to write auth secret: ", err)
+		}
+	}
+	// ========================================================
+
+	// 原有 PROXY Protocol 写入逻辑
 	if o.config.ProxyProtocolVersion != proxyprotocol.VersionUnspecified {
 		var localAddress netip.AddrPort
 		localAddress, err = netip.ParseAddrPort(conn.LocalAddr().String())
