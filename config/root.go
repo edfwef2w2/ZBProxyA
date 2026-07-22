@@ -25,7 +25,8 @@ type _Root struct {
 	// AuthSecret is a shared pre-shared key (max authsecret.MaxLen bytes).
 	// Outbounds with SendAuthSecret write it first; Services with RequireAuthSecret verify it first.
 	// Leave empty to disable. Both sides must match exactly.
-	AuthSecret string `json:",omitempty"`
+	// No omitempty: keep the key visible in generated/default config so users can find it.
+	AuthSecret string `json:"AuthSecret"`
 }
 
 type Root struct {
@@ -154,14 +155,20 @@ func LoadConfigFromFile(ctx context.Context, filePath string, watch bool, logger
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			logger.Warn().Msg("Config file does not exist, generating a new one...")
+			// Default template includes AuthSecret fields so first-open config is discoverable.
+			// Auth is OFF until you set AuthSecret and flip RequireAuthSecret / SendAuthSecret.
 			rawConfig = _Root{
 				Log: Log{
 					Level: log.DebugLevel,
 				},
+				// Shared PSK for A→B chain. Empty = disabled. Max 128 bytes. Must match on both nodes.
+				AuthSecret: "",
 				Services: []*Service{
 					{
 						Name:   "Hypixel-in",
 						Listen: 25565,
+						// true only on exit-node listeners that accept upstream ZBProxy (not player-facing).
+						RequireAuthSecret: false,
 					},
 				},
 				Router: Router{
@@ -189,6 +196,9 @@ func LoadConfigFromFile(ctx context.Context, filePath string, watch bool, logger
 						Name:          "Hypixel-out",
 						TargetAddress: "mc.hypixel.net",
 						TargetPort:    25565,
+						// true only when this outbound targets another ZBProxy with RequireAuthSecret.
+						// Keep false when targeting public game servers (e.g. Hypixel).
+						SendAuthSecret: false,
 						Minecraft: &MinecraftService{
 							OnlineCount: onlineCount{
 								Max:    20,

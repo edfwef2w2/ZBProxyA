@@ -11,7 +11,8 @@ type Service struct {
 	EnableProxyProtocol bool `json:",omitempty"`
 	// RequireAuthSecret enables inbound pre-shared-key verification using Root.AuthSecret.
 	// Only enable on edge listeners that accept traffic from an upstream ZBProxy node.
-	RequireAuthSecret bool                            `json:",omitempty"`
+	// Always serialized so it appears in generated config (default false = off).
+	RequireAuthSecret bool                            `json:"RequireAuthSecret"`
 	IPAccess          access                          `json:",omitempty"`
 	Minecraft         *MinecraftService               `json:",omitempty"`
 	TLSSniffing       *tlsSniffing                    `json:",omitempty"`
