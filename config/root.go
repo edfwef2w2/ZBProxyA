@@ -16,19 +16,27 @@ import (
 )
 
 type _Root struct {
-	Log       Log
-	Services  []*Service
-	Router    Router
-	Outbounds []*Outbound
-	Lists     map[string]set.StringSet
+	Log        Log
+	Services   []*Service
+	Router     Router
+	Outbounds  []*Outbound
+	Lists      map[string]set.StringSet
+	// AuthSecret 自定义验证密钥（可选）
+	// 用于在 TCP 连接数据最前面添加一段固定密钥进行简单身份验证
+	// 第一台（A）出站时先发送此密钥，第二台（B）入站时先校验此密钥
+	// 建议长度 ≥ 16 字节，两边必须完全一致
+	// 留空则不启用自定义验证
+	AuthSecret string `json:",omitempty"`
 }
 
 type Root struct {
-	Log       Log
-	Services  []*Service
-	Router    Router
-	Outbounds []*Outbound
-	Lists     map[string]set.StringSet
+	Log        Log
+	Services   []*Service
+	Router     Router
+	Outbounds  []*Outbound
+	Lists      map[string]set.StringSet
+	// AuthSecret 自定义验证密钥（与 _Root 对应）
+	AuthSecret string
 
 	ctx           context.Context
 	logger        *log.Logger
@@ -95,19 +103,19 @@ func (r *Root) reloadEventLoop() {
 			return
 		}
 		startTime := time.Now()
-
 		var rawConfig _Root
 		err := loadContent(&rawConfig, r.filePath)
 		if err != nil {
 			r.logger.Error().Err(err).Msg("Error when loading content from file")
 			continue
 		}
-
+		// 同步所有字段（包含新增的 AuthSecret）
 		r.Log = rawConfig.Log
 		r.Services = rawConfig.Services
 		r.Router = rawConfig.Router
 		r.Outbounds = rawConfig.Outbounds
 		r.Lists = rawConfig.Lists
+		r.AuthSecret = rawConfig.AuthSecret
 
 		if r.updateHandler != nil {
 			r.updateHandler()
@@ -180,6 +188,8 @@ func LoadConfigFromFile(ctx context.Context, filePath string, watch bool, logger
 					},
 				},
 				Lists: map[string]set.StringSet{},
+				// 默认生成时给出 AuthSecret 示例（可自行修改或删除）
+				// AuthSecret: "YourSuperSecretKeyHere123!",
 			}
 			var file *os.File
 			file, err = os.Create("ZBProxy.json")
@@ -197,15 +207,17 @@ func LoadConfigFromFile(ctx context.Context, filePath string, watch bool, logger
 			return nil, common.Cause("load config: ", err)
 		}
 	}
+
 	root := &Root{
-		Log:       rawConfig.Log,
-		Services:  rawConfig.Services,
-		Router:    rawConfig.Router,
-		Outbounds: rawConfig.Outbounds,
-		Lists:     rawConfig.Lists,
-		ctx:       ctx,
-		logger:    logger,
-		filePath:  filePath,
+		Log:        rawConfig.Log,
+		Services:   rawConfig.Services,
+		Router:     rawConfig.Router,
+		Outbounds:  rawConfig.Outbounds,
+		Lists:      rawConfig.Lists,
+		AuthSecret: rawConfig.AuthSecret, // 同步自定义验证密钥
+		ctx:        ctx,
+		logger:     logger,
+		filePath:   filePath,
 	}
 	if watch {
 		root.watcher, err = fsnotify.NewWatcher()
